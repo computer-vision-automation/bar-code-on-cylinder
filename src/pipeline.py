@@ -16,7 +16,7 @@ except ImportError:
         HAS_ZXING_LEGACY = False
 
 class TestTubeBarcodePipeline:
-    def __init__(self, tube_radius_px=150, blur_threshold=100.0):
+    def __init__(self, tube_radius_px=160, blur_threshold=100.0):
         """
         :param tube_radius_px: Estimated radius of test tube in camera frame (pixels)
         :param blur_threshold: Minimum Laplacian variance to accept frame
@@ -29,6 +29,20 @@ class TestTubeBarcodePipeline:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
         variance = cv2.Laplacian(gray, cv2.CV_64F).var()
         return variance >= self.blur_threshold, variance
+
+    def preprocess_for_decoding(self, image):
+        """Enhance contrast and reduce glare for glossy test tubes."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        
+        # 1. CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        # 2. Sharpening filter
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel)
+        
+        return sharpened
 
     def unwrap_cylinder_roi(self, roi):
         """
@@ -54,10 +68,47 @@ class TestTubeBarcodePipeline:
 
         return cv2.remap(roi, map_x, map_y, cv2.INTER_LINEAR)
 
+    def blend_strips(self, strip1, strip2, blend_width=15):
+        """Blends two image strips horizontally over a transition zone using alpha gradients."""
+        h, w1 = strip1.shape[:2]
+        w2 = strip2.shape[1]
+        
+        blend_width = min(blend_width, w1, w2)
+        
+        # Create 1D alpha ramp: 1.0 down to 0.0 across overlap columns
+        alpha = np.linspace(1.0, 0.0, blend_width).astype(np.float32)
+        
+        # Expand dimensions for matrix broadcast depending on color channels
+        if len(strip1.shape) == 3:
+            alpha = alpha[np.newaxis, :, np.newaxis]  # Shape: (1, blend_width, 1)
+        else:
+            alpha = alpha[np.newaxis, :]               # Shape: (1, blend_width)
+            
+        beta = 1.0 - alpha
+        
+        # Construct output canvas
+        blended_w = w1 + w2 - blend_width
+        blended_shape = (h, blended_w, 3) if len(strip1.shape) == 3 else (h, blended_w)
+        blended = np.zeros(blended_shape, dtype=strip1.dtype)
+        
+        # Copy non-overlapping left region
+        blended[:, :w1 - blend_width] = strip1[:, :-blend_width]
+        
+        # Vectorized alpha blend across overlap region
+        overlap1 = strip1[:, w1 - blend_width:].astype(np.float32)
+        overlap2 = strip2[:, :blend_width].astype(np.float32)
+        blended_overlap = overlap1 * alpha + overlap2 * beta
+        blended[:, w1 - blend_width:w1] = np.clip(blended_overlap, 0, 255).astype(np.uint8)
+        
+        # Copy non-overlapping right region
+        blended[:, w1:] = strip2[:, blend_width:]
+        
+        return blended
+
     def stitch_views(self, left_reflection, center_view, right_reflection):
         """
-        Flips mirror views and horizontally stitches the 3 viewpoints
-        into a single flat 360-degree strip.
+        Flips mirror views, applies cylindrical unwrapping, and seamlessly
+        blends the 3 viewpoints into a single flat 360-degree strip.
         """
         left_flipped = cv2.flip(left_reflection, 1)
         right_flipped = cv2.flip(right_reflection, 1)
@@ -66,19 +117,34 @@ class TestTubeBarcodePipeline:
         u_center = self.unwrap_cylinder_roi(center_view)
         u_right = self.unwrap_cylinder_roi(right_flipped)
 
-        return cv2.hconcat([u_left, u_center, u_right])
+        # Blend Left + Center, then blend the combined strip with Right
+        left_center_blended = self.blend_strips(u_left, u_center, blend_width=15)
+        full_stitched = self.blend_strips(left_center_blended, u_right, blend_width=15)
+
+        return full_stitched
 
     def decode_barcode(self, image):
-        """Multi-engine decoder: Primary (ZXing-CPP) -> Fallback (PyZBar)"""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        """Multi-engine decoder with contrast enhancement."""
+        processed_gray = self.preprocess_for_decoding(image)
 
         # 1. ZXing-CPP Engine
         if HAS_ZXING:
-            zx_results = zxingcpp.read_barcodes(gray)
+            zx_results = zxingcpp.read_barcodes(processed_gray)
             if zx_results:
                 return [{"engine": "zxing-cpp", "text": r.text, "format": str(r.format)} for r in zx_results]
 
         # 2. PyZBar Engine
+        pyz_results = pyzbar.decode(processed_gray)
+        if pyz_results:
+            return [{"engine": "pyzbar", "text": r.data.decode('utf-8'), "format": r.type} for r in pyz_results]
+
+        # Fallback pass on original non-preprocessed grayscale if contrast tuning over-sharpened
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        if HAS_ZXING:
+            zx_results = zxingcpp.read_barcodes(gray)
+            if zx_results:
+                return [{"engine": "zxing-cpp", "text": r.text, "format": str(r.format)} for r in zx_results]
+        
         pyz_results = pyzbar.decode(gray)
         if pyz_results:
             return [{"engine": "pyzbar", "text": r.data.decode('utf-8'), "format": r.type} for r in pyz_results]
