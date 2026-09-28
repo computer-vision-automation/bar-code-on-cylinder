@@ -1,59 +1,62 @@
 import cv2
-import os
+import sys
 from pipeline import TestTubeBarcodePipeline
 
-# Initialize pipeline
-pipeline = TestTubeBarcodePipeline(tube_radius_px=150, blur_threshold=50.0)
+# Calibrated ROI parameters locked from calibrate_roi.py
+LEFT_MIRROR_ROI  = (275, 137, 227, 1008)
+CENTER_TUBE_ROI  = (626, 137, 226, 1008)
+RIGHT_MIRROR_ROI = (1332, 137, 187, 1008)
+TUBE_RADIUS_PX   = 160
 
-# Path to your sample image
-IMAGE_PATH = "test_images/sample_tube.jpg"
+pipeline = TestTubeBarcodePipeline(tube_radius_px=TUBE_RADIUS_PX, blur_threshold=50.0)
 
-if not os.path.exists(IMAGE_PATH):
-    print(f"❌ Error: Image file '{IMAGE_PATH}' not found!")
-    print("Please place a test image of a test tube in the 'test_images' folder.")
-    exit()
+# 0 is usually default laptop camera, 1 or 2 will be the external Arducam
+cap = cv2.VideoCapture(0)
 
-# Load test image
-frame = cv2.imread(IMAGE_PATH)
-h, w, _ = frame.shape
-print(f"Loaded image: {w}x{h} px")
+# Set Arducam high resolution
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
 
-# Set estimated ROI bounding boxes: (x, y, width, height)
-# Adjust these relative to your image dimensions!
-LEFT_MIRROR_ROI  = (int(w * 0.1),  int(h * 0.2), int(w * 0.25), int(h * 0.6))
-CENTER_TUBE_ROI  = (int(w * 0.38), int(h * 0.2), int(w * 0.25), int(h * 0.6))
-RIGHT_MIRROR_ROI = (int(w * 0.65), int(h * 0.2), int(w * 0.25), int(h * 0.6))
+if not cap.isOpened():
+    print("❌ Error: Could not open camera.")
+    sys.exit(1)
 
-# Execute processing pipeline
-result = pipeline.process_frame(
-    frame, 
-    LEFT_MIRROR_ROI, 
-    CENTER_TUBE_ROI, 
-    RIGHT_MIRROR_ROI
-)
+print("🎥 Live Arducam Pipeline Started. Press 'q' to exit.")
 
-print(f"Status: {result['status']} | Sharpness Variance: {result['variance']:.2f}")
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("❌ Failed to grab frame.")
+        break
 
-# Display Barcode Results
-if result["barcodes"]:
-    for bc in result["barcodes"]:
-        print(f"✅ DECODED [{bc['engine']}]: {bc['text']} ({bc['format']})")
-else:
-    print("❌ No barcode decoded. Check ROI boxes or image lighting.")
+    result = pipeline.process_frame(
+        frame, 
+        LEFT_MIRROR_ROI, 
+        CENTER_TUBE_ROI, 
+        RIGHT_MIRROR_ROI
+    )
 
-# Show original with drawn ROI boxes and the unwrapped flat strip
-preview = frame.copy()
-for (x, y, rw, rh), color in zip(
-    [LEFT_MIRROR_ROI, CENTER_TUBE_ROI, RIGHT_MIRROR_ROI], 
-    [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
-):
-    cv2.rectangle(preview, (x, y), (x + rw, y + rh), color, 2)
+    # Draw ROI boxes
+    preview = frame.copy()
+    for (x, y, rw, rh), color in zip(
+        [LEFT_MIRROR_ROI, CENTER_TUBE_ROI, RIGHT_MIRROR_ROI], 
+        [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    ):
+        cv2.rectangle(preview, (x, y), (x + rw, y + rh), color, 2)
 
-cv2.imshow("Input Frame with ROIs", preview)
+    if result["barcodes"]:
+        for idx, bc in enumerate(result["barcodes"]):
+            msg = f"✅ [{bc['engine']}]: {bc['text']}"
+            cv2.putText(preview, msg, (30, 60 + (idx * 40)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
 
-if result["unwrapped_strip"] is not None:
-    cv2.imshow("Unwrapped 360-Degree Flat Strip", result["unwrapped_strip"])
+    cv2.imshow("Live Feed - Camera View", preview)
 
-print("Press any key on the image window to exit...")
-cv2.waitKey(0)
+    if result["unwrapped_strip"] is not None:
+        cv2.imshow("Live Unwrapped 360 Strip", result["unwrapped_strip"])
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
 cv2.destroyAllWindows()
